@@ -52,3 +52,14 @@ class EvidenceItem(BaseModel):
 class EvidencePack(BaseModel):
     """Collection of all research evidence."""
     items: List[EvidenceItem] = Field(default_factory=list)
+
+
+# =============================================================================
+# Stage 3: Image Generation (simple dataclasses, parsing done in node)
+# =============================================================================
+
+class ImageSpec(BaseModel):
+    """Specification for one image to be generated."""
+    placeholder: str = Field(description="Placeholder like '{{IMAGE_1}}'")
+    file_name: str = Field(description="Target file name, e.g. 'diagram.png'")
+    prompt: str = Field(description="Detailed image generation prompt")

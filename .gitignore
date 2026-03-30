@@ -180,14 +180,13 @@ blogs.db
 *.sqlite
 *.sqlite3
 
-# Generated images
-images/
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.svg
-*.webp
+# Generated images in output folders only
+output/**/*.png
+output/**/*.jpg
+output/**/*.jpeg
+output/**/*.gif
+output/**/*.svg
+output/**/*.webp
 
 # Temporary / cache files
 *.tmp
@@ -203,7 +202,6 @@ logs/
 .streamlit/
 
 # Environment files (keep .env.example as template)
-.env
 .env.local
 .env.development
 .env.production

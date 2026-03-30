@@ -13,11 +13,13 @@ from nodes.reducer_graph import (
     merge_content_node,
     decide_images_node,
     generate_and_place_images_node,
+    finalize_blog_node,
+    route_after_merge,
 )
 
 
 def build_graph():
-    """Build and compile the Blog Writing Agent graph (Stage 3 with images)."""
+    """Build and compile the Blog Writing Agent graph (Stage 4)."""
     graph = StateGraph(BlogState)
 
     graph.add_node("router", router_node)
@@ -25,10 +27,11 @@ def build_graph():
     graph.add_node("orchestrator", orchestrator_node)
     graph.add_node("worker_node", worker_node)
 
-    # Stage 3: Reducer sub-graph as 3 sequential nodes
+    # Reducer sub-graph nodes
     graph.add_node("merge_content", merge_content_node)
     graph.add_node("decide_images", decide_images_node)
     graph.add_node("generate_and_place_images", generate_and_place_images_node)
+    graph.add_node("finalize_blog", finalize_blog_node)
 
     graph.add_edge(START, "router")
 
@@ -41,10 +44,15 @@ def build_graph():
     graph.add_edge("research_node", "orchestrator")
     graph.add_conditional_edges("orchestrator", fan_out_to_workers, ["worker_node"])
 
-    # Reducer sub-graph edges
+    # Reducer: merge → conditional → (images pipeline | finalize)
     graph.add_edge("worker_node", "merge_content")
-    graph.add_edge("merge_content", "decide_images")
+    graph.add_conditional_edges(
+        "merge_content",
+        route_after_merge,
+        {"decide_images": "decide_images", "finalize_blog": "finalize_blog"},
+    )
     graph.add_edge("decide_images", "generate_and_place_images")
     graph.add_edge("generate_and_place_images", END)
+    graph.add_edge("finalize_blog", END)
 
     return graph.compile()

@@ -1,8 +1,9 @@
 """
-Reducer sub-graph nodes for Stage 3:
-1. merge_content - Combine worker outputs
-2. decide_images - Identify where images should go
-3. generate_and_place_images - Generate images via Gemini and replace placeholders
+Reducer sub-graph nodes for Stage 3/4:
+1. merge_content      – Combine worker outputs
+2. decide_images      – (optional) Identify where images should go
+3. generate_and_place – (optional) Generate images via Gemini and replace placeholders
+4. finalize_blog      – Save blog to per-run output dir (used when images are skipped)
 """
 
 import os
@@ -15,6 +16,29 @@ from utils.json_parser import parse_json_from_response
 from utils.image_generation import gemini_generate_image
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_output_dir(state: BlogState) -> str:
+    """Return per-blog output directory, creating it if needed."""
+    out = state.get("output_dir") or OUTPUT_DIR
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def _save_blog(output_dir: str, markdown: str):
+    """Write blog.md into the given output directory."""
+    path = os.path.join(output_dir, "blog.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(markdown)
+    print(f"[Save] blog.md → {path} ({len(markdown):,} chars)")
+
+
+# ---------------------------------------------------------------------------
+# Node 1 – Merge content
+# ---------------------------------------------------------------------------
+
 def merge_content_node(state: BlogState) -> dict:
     """Combine all parallel worker outputs into a single markdown string."""
     title = state["plan"].title
@@ -23,6 +47,21 @@ def merge_content_node(state: BlogState) -> dict:
     print(f"[Merge] Combined {len(sections)} sections into merged_markdown")
     return {"merged_markdown": merged}
 
+
+# ---------------------------------------------------------------------------
+# Conditional router after merge
+# ---------------------------------------------------------------------------
+
+def route_after_merge(state: BlogState) -> str:
+    """Route to image pipeline or directly to finalize based on user toggle."""
+    if state.get("generate_images", False):
+        return "decide_images"
+    return "finalize_blog"
+
+
+# ---------------------------------------------------------------------------
+# Node 2 – Decide images (only when images enabled)
+# ---------------------------------------------------------------------------
 
 _DECIDE_IMAGES_PROMPT = """You are an expert technical editor and visual content planner.
 
@@ -54,7 +93,6 @@ Rules:
 
 def _normalize_image_data(raw: dict) -> tuple:
     """Extract markdown and image specs from raw LLM JSON, handling various formats."""
-    # --- Extract markdown ---
     markdown = ""
     for key in ("markdown_with_placeholders", "content", "markdown", "blog"):
         val = raw.get(key)
@@ -62,11 +100,9 @@ def _normalize_image_data(raw: dict) -> tuple:
             markdown = val
             break
         elif isinstance(val, list):
-            # LLM sometimes returns markdown as list of lines
             markdown = "\n".join(str(line) for line in val)
             break
 
-    # --- Extract image specs ---
     specs = []
     raw_images = raw.get("images", [])
     if not isinstance(raw_images, list):
@@ -75,17 +111,14 @@ def _normalize_image_data(raw: dict) -> tuple:
     for i, img in enumerate(raw_images):
         if not isinstance(img, dict):
             continue
-        # Normalize placeholder
         placeholder = str(img.get("placeholder", img.get("id", f"IMAGE_{i+1}")))
         if not placeholder.startswith("{{"):
             placeholder = "{{" + placeholder.rstrip("}}").lstrip("{{") + "}}"
         if not re.match(r"\{\{IMAGE_\d+\}\}", placeholder):
             placeholder = f"{{{{IMAGE_{i+1}}}}}"
-        # Normalize file_name
         file_name = str(img.get("file_name", img.get("filename", f"image_{i+1}.png")))
         if not file_name.endswith((".png", ".jpg", ".jpeg")):
             file_name = f"image_{i+1}.png"
-        # Normalize prompt
         prompt = str(img.get("prompt", img.get("description", "")))
         if prompt:
             specs.append(ImageSpec(placeholder=placeholder, file_name=file_name, prompt=prompt))
@@ -102,7 +135,6 @@ def decide_images_node(state: BlogState) -> dict:
         ("human", f"Plan images for this blog and respond with valid JSON:\n\n{merged[:8000]}")
     ])
 
-    # Parse the JSON from the response
     try:
         raw = parse_json_from_response(response.content)
         markdown, image_specs = _normalize_image_data(raw)
@@ -111,7 +143,6 @@ def decide_images_node(state: BlogState) -> dict:
         markdown = ""
         image_specs = []
 
-    # Fallback: if parsing produced no/short markdown, use original
     if not markdown or len(markdown) < 100:
         print(f"[DecideImages] Using original merged markdown (LLM returned empty/short)")
         markdown = merged
@@ -126,12 +157,17 @@ def decide_images_node(state: BlogState) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Node 3 – Generate & place images (only when images enabled)
+# ---------------------------------------------------------------------------
+
 def generate_and_place_images_node(state: BlogState) -> dict:
     """Generate images via Gemini and replace placeholders with actual image paths."""
+    out_dir = _get_output_dir(state)
     markdown = state["markdown_with_placeholders"]
     image_specs = state.get("image_specs", [])
 
-    images_dir = os.path.join(OUTPUT_DIR, "images")
+    images_dir = os.path.join(out_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
 
     for i, spec in enumerate(image_specs):
@@ -151,10 +187,18 @@ def generate_and_place_images_node(state: BlogState) -> dict:
             print(f"[GenerateImage] Error for {file_name}: {e}")
             markdown = markdown.replace(spec.placeholder, "")
 
-    # Save final blog
-    output_path = os.path.join(OUTPUT_DIR, "blog.md")
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(markdown)
+    _save_blog(out_dir, markdown)
+    return {"final_blog": markdown, "output_dir": out_dir}
 
-    print(f"[GenerateImage] Final blog saved ({len(markdown)} chars)")
-    return {"final_blog": markdown}
+
+# ---------------------------------------------------------------------------
+# Node 4 – Finalize blog (no images path)
+# ---------------------------------------------------------------------------
+
+def finalize_blog_node(state: BlogState) -> dict:
+    """Save merged markdown as final blog when image generation is skipped."""
+    out_dir = _get_output_dir(state)
+    markdown = state["merged_markdown"]
+    _save_blog(out_dir, markdown)
+    print(f"[Finalize] Blog saved without images ({len(markdown):,} chars)")
+    return {"final_blog": markdown, "output_dir": out_dir}

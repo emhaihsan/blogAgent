@@ -2,10 +2,7 @@
 
 A sophisticated **Planning AI Agent** built with **LangGraph** that generates comprehensive, research-backed blog posts with automatic image generation. Unlike simple LLM prompts, this agent creates a structured plan first, then executes it step-by-step for higher quality output.
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://python.org)
-[![LangGraph](https://img.shields.io/badge/LangGraph-0.0.x-green)](https://langchain-ai.github.io/langgraph/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.0%2B-FF4B4B)](https://streamlit.io)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![AI Blog Writing Agent Screenshot](screenshot.png)
 
 ---
 
@@ -224,22 +221,6 @@ Edit `backend.py` to customize:
 
 ---
 
-## Screenshots
-
-### Plan View
-![Plan Tab](docs/images/plan_tab.png)
-*Structured plan with sections, target words, and metadata*
-
-### Blog View
-![Blog Tab](docs/images/blog_tab.png)
-*Rendered markdown blog with embedded images*
-
-### Evidence View
-![Evidence Tab](docs/images/evidence_tab.png)
-*Research citations with clickable source links*
-
----
-
 ## Cost Estimates
 
 Based on typical usage:
@@ -252,17 +233,6 @@ Based on typical usage:
 | **Total per blog** | **~$0.20-0.50 USD** |
 
 *Actual costs depend on blog length, section count, and image quantity.*
-
----
-
-## Roadmap
-
-- [ ] Add support for custom templates (technical, marketing, academic)
-- [ ] Implement blog revision feedback loop
-- [ ] Add export formats (PDF, HTML, DOCX)
-- [ ] Integration with content management systems
-- [ ] Multi-language blog generation
-- [ ] Advanced image style customization
 
 ---
 

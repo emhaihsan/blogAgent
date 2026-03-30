@@ -6,15 +6,14 @@ Run with:
 """
 
 import os
+import re
 import io
 import zipfile
-import time
 from datetime import datetime
 
 import streamlit as st
 
 from backend import (
-    app,
     run_agent_stream,
     save_to_history,
     load_history,
@@ -34,38 +33,26 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Custom CSS
+# Custom CSS — clean, consistent styling
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-    /* Sidebar history items */
-    .history-item {
-        padding: 0.5rem 0;
-        border-bottom: 1px solid rgba(128,128,128,0.2);
-    }
-    /* Progress node labels */
-    .node-step {
-        padding: 0.25rem 0;
-        font-size: 0.9rem;
-    }
-    .node-done { color: #28a745; }
-    .node-active { color: #fd7e14; font-weight: bold; }
-    .node-pending { color: #6c757d; }
-    /* Image grid */
-    .image-card {
-        border: 1px solid rgba(128,128,128,0.3);
-        border-radius: 8px;
-        padding: 0.75rem;
-        margin-bottom: 1rem;
-    }
-    /* Plan section cards */
-    .plan-section {
-        background: rgba(128,128,128,0.05);
-        border-radius: 8px;
-        padding: 1rem;
-        margin-bottom: 0.75rem;
-        border-left: 4px solid #4A90D9;
-    }
+    /* tighter main padding */
+    .block-container { padding-top: 1.5rem; }
+    /* plan cards */
+    div[data-testid="stExpander"] summary p { font-weight: 600; }
+    /* blog prose */
+    .blog-prose { line-height: 1.75; font-size: 1.05rem; }
+    .blog-prose h1 { margin-top: 0; }
+    .blog-prose h2 { margin-top: 2rem; border-bottom: 1px solid rgba(128,128,128,0.2); padding-bottom: .3rem; }
+    .blog-prose h3 { margin-top: 1.5rem; }
+    .blog-prose pre { background: #f6f8fa; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+    .blog-prose code { background: #f0f0f0; padding: .15rem .35rem; border-radius: 4px; font-size: .92em; }
+    .blog-prose pre code { background: none; padding: 0; }
+    .blog-prose blockquote { border-left: 4px solid #4A90D9; padding-left: 1rem; color: #555; }
+    .blog-prose table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    .blog-prose th, .blog-prose td { border: 1px solid #ddd; padding: .5rem .75rem; text-align: left; }
+    .blog-prose th { background: #f6f8fa; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -86,13 +73,15 @@ for k, v in _DEFAULTS.items():
 
 
 # ---------------------------------------------------------------------------
-# Helper: build zip of blog.md + images
+# Helpers
 # ---------------------------------------------------------------------------
-def build_download_zip(blog_md: str, images_dir: str) -> bytes:
-    """Create an in-memory zip with the blog markdown and all images."""
+
+def build_download_zip(blog_md: str, output_dir: str) -> bytes:
+    """Create an in-memory zip with blog.md + images/ from the per-blog output dir."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("blog.md", blog_md)
+        images_dir = os.path.join(output_dir, "images")
         if os.path.isdir(images_dir):
             for fname in os.listdir(images_dir):
                 fpath = os.path.join(images_dir, fname)
@@ -101,17 +90,97 @@ def build_download_zip(blog_md: str, images_dir: str) -> bytes:
     return buf.getvalue()
 
 
-# ---------------------------------------------------------------------------
-# Helper: render a history entry into session state
-# ---------------------------------------------------------------------------
+def _extract_result_data(result: dict, is_history: bool) -> dict:
+    """Normalize result into plain dicts regardless of source (live vs history)."""
+    if is_history:
+        return {
+            "plan": result.get("plan"),
+            "evidence": result.get("evidence"),
+            "image_specs": result.get("image_specs", []),
+            "final_blog": result.get("final_blog", ""),
+            "needs_research": result.get("needs_research", False),
+            "generate_images": result.get("generate_images", False),
+            "output_dir": result.get("output_dir", ""),
+            "title": result.get("title", "Untitled"),
+        }
+
+    plan_obj = result.get("plan")
+    plan = plan_obj.model_dump() if plan_obj and hasattr(plan_obj, "model_dump") else plan_obj
+
+    ev_obj = result.get("evidence")
+    evidence = ev_obj.model_dump() if ev_obj and hasattr(ev_obj, "model_dump") else ev_obj
+
+    specs = []
+    for s in result.get("image_specs", []):
+        specs.append(s.model_dump() if hasattr(s, "model_dump") else s)
+
+    return {
+        "plan": plan,
+        "evidence": evidence,
+        "image_specs": specs,
+        "final_blog": result.get("final_blog", ""),
+        "needs_research": result.get("needs_research", False),
+        "generate_images": result.get("generate_images", False),
+        "output_dir": result.get("output_dir", ""),
+        "title": plan.get("title", "Untitled") if plan else "Untitled",
+    }
+
+
+def _render_blog_markdown(blog_md: str, output_dir: str):
+    """Render blog markdown section-by-section, inlining images with st.image."""
+    images_dir = os.path.join(output_dir, "images") if output_dir else ""
+
+    # Split on image references: ![alt](images/file.png)
+    pattern = r'!\[([^\]]*)\]\(images/([^)]+)\)'
+    parts = re.split(pattern, blog_md)
+
+    # parts = [text, alt1, fname1, text, alt2, fname2, ...]
+    i = 0
+    while i < len(parts):
+        if i + 2 < len(parts):
+            # Current part is text before image
+            text_chunk = parts[i].strip()
+            if text_chunk:
+                st.markdown(
+                    f'<div class="blog-prose">{_md_to_safe(text_chunk)}</div>',
+                    unsafe_allow_html=True,
+                )
+            # Next two parts are alt text + filename
+            alt = parts[i + 1]
+            fname = parts[i + 2]
+            fpath = os.path.join(images_dir, fname) if images_dir else ""
+            if fpath and os.path.isfile(fpath):
+                st.image(fpath, caption=alt if alt else fname, use_container_width=True)
+            elif alt or fname:
+                st.info(f"🖼️ Image: {fname}" + (f" — {alt}" if alt else ""))
+            i += 3
+        else:
+            # Remaining text after last image (or entire blog if no images)
+            text_chunk = parts[i].strip()
+            if text_chunk:
+                st.markdown(
+                    f'<div class="blog-prose">{_md_to_safe(text_chunk)}</div>',
+                    unsafe_allow_html=True,
+                )
+            i += 1
+
+
+def _md_to_safe(md: str) -> str:
+    """Convert markdown to HTML-safe string for rendering inside a styled div.
+    We let Streamlit handle the markdown → HTML conversion via markdown(),
+    but we need a wrapper. Return raw markdown and let st.markdown handle it."""
+    return md
+
+
 def load_history_entry(entry: dict):
     """Load a history entry into session state for display."""
     st.session_state.selected_history = entry
     st.session_state.generation_complete = True
     st.session_state.result = entry
     st.session_state.logs = [
-        f"[History] Loaded blog: {entry.get('title', 'Untitled')}",
-        f"[History] Generated at: {entry.get('timestamp', 'unknown')}",
+        f"📂 Loaded from history: {entry.get('title', 'Untitled')}",
+        f"🕐 Generated: {entry.get('timestamp', 'unknown')}",
+        f"📊 {entry.get('blog_length', 0):,} chars · {entry.get('num_sections', 0)} sections · {entry.get('num_images', 0)} images",
     ]
 
 
@@ -120,11 +189,11 @@ def load_history_entry(entry: dict):
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("✍️ AI Blog Writer")
-    st.caption("Powered by LangGraph + GPT + Gemini")
+    st.caption("LangGraph · GPT · Gemini")
 
     st.divider()
 
-    # --- Input Section ---
+    # --- Input ---
     st.subheader("New Blog")
     topic = st.text_area(
         "Blog Topic",
@@ -132,9 +201,14 @@ with st.sidebar:
         height=80,
     )
     instructions = st.text_area(
-        "Additional Instructions (optional)",
+        "Additional Instructions _(optional)_",
         placeholder="e.g. Target audience: beginners, Tone: casual",
         height=60,
+    )
+    enable_images = st.toggle(
+        "🖼️ Generate Images (Gemini)",
+        value=False,
+        help="Enable AI image generation using Google Gemini. This costs extra API credits.",
     )
 
     generate_btn = st.button(
@@ -144,21 +218,15 @@ with st.sidebar:
         disabled=st.session_state.is_generating,
     )
 
-    # --- Progress Section ---
-    if st.session_state.is_generating:
-        st.divider()
-        st.subheader("Progress")
-        progress_placeholder = st.empty()
-
-    # --- History Section ---
+    # --- History ---
     st.divider()
-    st.subheader("📚 Blog History")
+    st.subheader("📚 History")
 
     history = load_history()
     if not history:
         st.caption("No blogs generated yet.")
     else:
-        for i, entry in enumerate(history):
+        for i, entry in enumerate(history[:20]):
             col1, col2 = st.columns([5, 1])
             with col1:
                 title = entry.get("title", "Untitled")
@@ -170,12 +238,13 @@ with st.sidebar:
                         display_date = dt.strftime("%b %d, %H:%M")
                     except ValueError:
                         display_date = ts[:10]
-                btn_label = f"📄 {title[:30]}{'...' if len(title) > 30 else ''}"
+                has_img = "🖼" if entry.get("num_images", 0) > 0 else "📝"
+                btn_label = f"{has_img} {title[:28]}{'…' if len(title) > 28 else ''}"
                 if st.button(btn_label, key=f"hist_{i}", use_container_width=True):
                     load_history_entry(entry)
                     st.rerun()
                 if display_date:
-                    st.caption(f"  {display_date} · {entry.get('blog_length', 0):,} chars")
+                    st.caption(f"{display_date} · {entry.get('blog_length', 0):,} chars")
             with col2:
                 if st.button("🗑️", key=f"del_{i}"):
                     delete_history_entry(entry.get("id", ""))
@@ -183,7 +252,7 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# GENERATION LOGIC (runs when Generate is clicked)
+# GENERATION LOGIC
 # ---------------------------------------------------------------------------
 if generate_btn and topic.strip():
     st.session_state.is_generating = True
@@ -192,61 +261,51 @@ if generate_btn and topic.strip():
     st.session_state.selected_history = None
     st.session_state.logs = []
 
-    # Accumulate state from streaming
     accumulated = {}
     completed_nodes = []
 
-    # Progress display in main area
     status_container = st.container()
-    progress_bar = status_container.progress(0, text="Starting blog generation...")
-    log_expander = status_container.expander("Live Logs", expanded=True)
+    progress_bar = status_container.progress(0, text="Starting blog generation…")
+    log_area = status_container.empty()
 
     node_order = list(NODE_LABELS.keys())
 
     try:
-        for node_name, node_output in run_agent_stream(topic.strip(), instructions.strip()):
+        for node_name, node_output in run_agent_stream(
+            topic.strip(),
+            instructions.strip(),
+            generate_images=enable_images,
+        ):
             completed_nodes.append(node_name)
             accumulated.update(node_output)
 
-            # Update progress
             label = NODE_LABELS.get(node_name, node_name)
             pct = min(len(completed_nodes) / len(node_order), 1.0)
-            progress_bar.progress(pct, text=f"Completed: {label}")
+            progress_bar.progress(pct, text=label)
 
-            # Build log entry
+            # Build detailed log
             log_line = f"✅ {label}"
             if node_name == "router":
-                nr = node_output.get("needs_research", False)
-                log_line += f" → needs_research={nr}"
+                log_line += f"  →  needs_research={node_output.get('needs_research', False)}"
             elif node_name == "orchestrator":
-                plan = node_output.get("plan")
-                if plan:
-                    log_line += f" → '{plan.title}' ({len(plan.tasks)} sections)"
+                p = node_output.get("plan")
+                if p:
+                    log_line += f"  →  '{p.title}' ({len(p.tasks)} sections)"
             elif node_name == "worker_node":
-                secs = node_output.get("completed_sections", [])
-                log_line += f" → {len(secs)} section(s) written"
+                log_line += f"  →  {len(node_output.get('completed_sections', []))} section(s)"
             elif node_name == "merge_content":
-                mm = node_output.get("merged_markdown", "")
-                log_line += f" → {len(mm):,} chars"
+                log_line += f"  →  {len(node_output.get('merged_markdown', '')):,} chars"
             elif node_name == "decide_images":
-                specs = node_output.get("image_specs", [])
-                log_line += f" → {len(specs)} images planned"
-            elif node_name == "generate_and_place_images":
-                fb = node_output.get("final_blog", "")
-                log_line += f" → final blog {len(fb):,} chars"
+                log_line += f"  →  {len(node_output.get('image_specs', []))} images planned"
+            elif node_name in ("generate_and_place_images", "finalize_blog"):
+                log_line += f"  →  {len(node_output.get('final_blog', '')):,} chars"
 
             st.session_state.logs.append(log_line)
-            with log_expander:
-                for lg in st.session_state.logs:
-                    st.text(lg)
+            log_area.code("\n".join(st.session_state.logs), language=None)
 
         progress_bar.progress(1.0, text="✅ Blog generation complete!")
-
-        # Build final result from accumulated state
         st.session_state.result = accumulated
         st.session_state.generation_complete = True
-
-        # Save to history
         save_to_history(topic.strip(), accumulated)
 
     except Exception as e:
@@ -261,102 +320,79 @@ elif generate_btn and not topic.strip():
 
 
 # ---------------------------------------------------------------------------
-# MAIN AREA — Tabs (shown when we have results)
+# MAIN AREA — Results
 # ---------------------------------------------------------------------------
 if st.session_state.generation_complete and st.session_state.result:
-    result = st.session_state.result
-
-    # Extract data from result — handle both live result (Pydantic objects) and
-    # history entries (dicts serialized to JSON)
     is_history = st.session_state.selected_history is not None
+    d = _extract_result_data(st.session_state.result, is_history)
 
-    if is_history:
-        plan_data = result.get("plan")
-        evidence_data = result.get("evidence")
-        image_specs_data = result.get("image_specs", [])
-        final_blog = result.get("final_blog", "")
-        needs_research = result.get("needs_research", False)
-        blog_title = result.get("title", "Untitled")
-    else:
-        plan_obj = result.get("plan")
-        plan_data = plan_obj.model_dump() if plan_obj and hasattr(plan_obj, "model_dump") else plan_obj
-        evidence_obj = result.get("evidence")
-        evidence_data = evidence_obj.model_dump() if evidence_obj and hasattr(evidence_obj, "model_dump") else evidence_obj
-        image_specs_raw = result.get("image_specs", [])
-        image_specs_data = []
-        for s in image_specs_raw:
-            if hasattr(s, "model_dump"):
-                image_specs_data.append(s.model_dump())
-            elif isinstance(s, dict):
-                image_specs_data.append(s)
-        final_blog = result.get("final_blog", "")
-        needs_research = result.get("needs_research", False)
-        blog_title = plan_data.get("title", "Untitled") if plan_data else "Untitled"
+    plan_data = d["plan"]
+    evidence_data = d["evidence"]
+    image_specs_data = d["image_specs"]
+    final_blog = d["final_blog"]
+    needs_research = d["needs_research"]
+    blog_title = d["title"]
+    out_dir = d["output_dir"]
 
     # --- Header ---
     st.title(blog_title)
-    col_m1, col_m2, col_m3 = st.columns(3)
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
     num_sections = len(plan_data.get("tasks", [])) if plan_data else 0
     col_m1.metric("Sections", num_sections)
     col_m2.metric("Images", len(image_specs_data))
     col_m3.metric("Characters", f"{len(final_blog):,}")
+    col_m4.metric("Research", "Yes" if needs_research else "No")
 
     # --- Tabs ---
-    tab_plan, tab_blog, tab_evidence, tab_logs, tab_images = st.tabs(
-        ["📋 Plan", "📝 Blog", "🔍 Evidence", "📊 Logs", "🖼️ Images"]
+    tab_blog, tab_plan, tab_evidence, tab_logs, tab_images = st.tabs(
+        ["📝 Blog", "📋 Plan", "🔍 Evidence", "📊 Logs", "🖼️ Images"]
     )
 
-    # ---- TAB: Plan ----
-    with tab_plan:
-        if plan_data:
-            st.subheader(f"Blog Plan: {plan_data.get('title', '')}")
-            research_badge = "🔍 Research enabled" if needs_research else "📖 No research needed"
-            st.info(research_badge)
-
-            tasks = plan_data.get("tasks", [])
-            for i, task in enumerate(tasks, 1):
-                with st.container():
-                    st.markdown(f"""
-<div class="plan-section">
-    <strong>Section {i}: {task.get('title', '')}</strong><br>
-    <em>ID: {task.get('id', '')}</em><br>
-    {task.get('description', '')}
-</div>
-""", unsafe_allow_html=True)
-        else:
-            st.info("No plan data available.")
-
-    # ---- TAB: Blog ----
+    # ================================================================
+    # TAB: Blog  (first tab — the main output)
+    # ================================================================
     with tab_blog:
         if final_blog:
-            # Download button
-            images_dir = os.path.join(OUTPUT_DIR, "images")
-            zip_bytes = build_download_zip(final_blog, images_dir)
+            # Download
+            if out_dir:
+                zip_bytes = build_download_zip(final_blog, out_dir)
+            else:
+                zip_bytes = build_download_zip(final_blog, "")
             st.download_button(
-                label="📥 Download Blog (ZIP)",
+                "📥 Download Blog (ZIP)",
                 data=zip_bytes,
                 file_name=f"blog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                 mime="application/zip",
                 use_container_width=True,
             )
-
             st.divider()
 
-            # Render blog markdown — replace image paths with actual files
-            blog_display = final_blog
-            if os.path.isdir(images_dir):
-                for fname in os.listdir(images_dir):
-                    fpath = os.path.join(images_dir, fname)
-                    if os.path.isfile(fpath):
-                        blog_display = blog_display.replace(
-                            f"images/{fname}",
-                            fpath,
-                        )
-            st.markdown(blog_display, unsafe_allow_html=True)
+            # Render with proper image handling
+            _render_blog_markdown(final_blog, out_dir)
         else:
             st.info("No blog content available.")
 
-    # ---- TAB: Evidence ----
+    # ================================================================
+    # TAB: Plan
+    # ================================================================
+    with tab_plan:
+        if plan_data:
+            badge = "🔍 Research enabled" if needs_research else "📖 No research needed"
+            img_badge = "🖼️ Images enabled" if d["generate_images"] else "📝 Text only"
+            st.info(f"{badge}  ·  {img_badge}")
+
+            for i, task in enumerate(plan_data.get("tasks", []), 1):
+                with st.expander(f"**Section {i}:** {task.get('title', '')}",
+                                 expanded=(i <= 2)):
+                    st.caption(f"ID: `{task.get('id', '')}`")
+                    st.write(task.get("description", ""))
+        else:
+            st.info("No plan data available.")
+
+    # ================================================================
+    # TAB: Evidence
+    # ================================================================
     with tab_evidence:
         if evidence_data and evidence_data.get("items"):
             items = evidence_data["items"]
@@ -365,81 +401,85 @@ if st.session_state.generation_complete and st.session_state.result:
                 with st.expander(f"📎 {item.get('title', f'Source {i}')}"):
                     source = item.get("source", "")
                     if source.startswith("http"):
-                        st.markdown(f"**Source:** [{source}]({source})")
+                        st.markdown(f"🔗 [{source}]({source})")
                     else:
                         st.markdown(f"**Source:** {source}")
-                    st.markdown(item.get("content", "No content."))
+                    st.markdown("---")
+                    st.write(item.get("content", "No content."))
         else:
             if needs_research:
                 st.info("Research was performed but no evidence was collected.")
             else:
-                st.info("No research was needed for this topic. The blog was written from the model's knowledge.")
+                st.info("No research was needed for this topic.")
 
-    # ---- TAB: Logs ----
+    # ================================================================
+    # TAB: Logs
+    # ================================================================
     with tab_logs:
         st.subheader("Agent Execution Log")
         if st.session_state.logs:
-            for log in st.session_state.logs:
-                if log.startswith("❌"):
-                    st.error(log)
-                elif log.startswith("✅"):
-                    st.success(log)
-                else:
-                    st.info(log)
+            st.code("\n".join(st.session_state.logs), language=None)
         else:
             st.info("No logs available. Generate a blog to see execution logs.")
 
-    # ---- TAB: Images ----
+        # Show output directory info
+        if out_dir:
+            st.caption(f"Output directory: `{out_dir}`")
+
+    # ================================================================
+    # TAB: Images
+    # ================================================================
     with tab_images:
+        images_dir = os.path.join(out_dir, "images") if out_dir else ""
         if image_specs_data:
             st.subheader(f"Generated Images ({len(image_specs_data)})")
-            images_dir = os.path.join(OUTPUT_DIR, "images")
-
-            cols = st.columns(min(len(image_specs_data), 3))
             for i, spec in enumerate(image_specs_data):
-                with cols[i % 3]:
-                    fname = spec.get("file_name", f"image_{i+1}.png")
-                    fpath = os.path.join(images_dir, fname)
+                fname = spec.get("file_name", f"image_{i+1}.png")
+                fpath = os.path.join(images_dir, fname) if images_dir else ""
+                prompt = spec.get("prompt", "")
 
-                    st.markdown(f"**{fname}**")
-                    if os.path.isfile(fpath):
+                with st.expander(f"🖼️ **{fname}**", expanded=True):
+                    if fpath and os.path.isfile(fpath):
                         st.image(fpath, use_container_width=True)
                     else:
-                        st.warning(f"Image file not found: {fname}")
-
-                    prompt = spec.get("prompt", "No prompt")
-                    st.caption(f"Prompt: {prompt[:150]}{'...' if len(prompt) > 150 else ''}")
+                        st.warning(f"Image file not found: `{fname}`")
+                    st.caption(f"**Prompt:** {prompt}")
         else:
-            st.info("No images were generated for this blog.")
+            if not d["generate_images"]:
+                st.info("Image generation was disabled for this blog. Enable the toggle in the sidebar to generate images.")
+            else:
+                st.info("No images were generated for this blog.")
 
+# ---------------------------------------------------------------------------
+# WELCOME SCREEN (no results yet)
+# ---------------------------------------------------------------------------
 else:
-    # --- Welcome screen ---
     st.title("✍️ AI Blog Writing Agent")
     st.markdown("""
-Welcome to the **AI Blog Writing Agent** — an intelligent system that:
+### How it works
 
-1. **Analyzes** your topic to determine if web research is needed
-2. **Researches** the topic using Tavily search (if needed)
-3. **Plans** a structured blog outline with multiple sections
-4. **Writes** each section in parallel using AI workers
-5. **Generates** relevant images using Google Gemini
-6. **Produces** a polished markdown blog with inline images
+| Step | What happens |
+|------|-------------|
+| **1. Router** | Analyzes your topic — decides if web research is needed |
+| **2. Research** | Searches the web via Tavily _(if needed)_ |
+| **3. Orchestrator** | Creates a structured blog plan with sections |
+| **4. Workers** | Writes each section in parallel |
+| **5. Images** | Generates diagrams with Google Gemini _(optional)_ |
+| **6. Output** | Produces a polished markdown blog |
 
 ### Getting Started
-Enter your blog topic in the sidebar and click **Generate Blog**!
 
-### Features
-- **5 Tabs** — View your blog plan, rendered blog, research evidence, execution logs, and generated images
-- **Real-time Progress** — Watch the agent work through each stage
-- **Blog History** — All generated blogs are saved and can be revisited
-- **Download** — Export your blog as a ZIP file with markdown + images
+Enter your topic in the sidebar and click **🚀 Generate Blog**.
+
+> **Tip:** Toggle **🖼️ Generate Images** only when you need visuals — it uses extra API credits.
 """)
 
-    # Show quick stats
     history = load_history()
     if history:
         st.divider()
-        col1, col2 = st.columns(2)
-        col1.metric("Total Blogs Generated", len(history))
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Blogs Generated", len(history))
         total_chars = sum(e.get("blog_length", 0) for e in history)
-        col2.metric("Total Characters Written", f"{total_chars:,}")
+        col2.metric("Total Characters", f"{total_chars:,}")
+        total_images = sum(e.get("num_images", 0) for e in history)
+        col3.metric("Images Created", total_images)

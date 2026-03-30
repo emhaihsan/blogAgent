@@ -17,6 +17,8 @@ from nodes.reducer_graph import (
     merge_content_node,
     decide_images_node,
     generate_and_place_images_node,
+    finalize_blog_node,
+    route_after_merge,
 )
 from graph.state import BlogState, WorkerState
 from utils.json_parser import parse_json_from_response
@@ -39,32 +41,41 @@ NODE_LABELS = {
     "merge_content": "📑 Merge — Combining sections",
     "decide_images": "🖼️ Decide Images — Planning visuals",
     "generate_and_place_images": "🎨 Generate Images — Creating visuals",
+    "finalize_blog": "✅ Finalize — Saving blog",
 }
 
 
-def run_agent_stream(topic: str, instructions: str = ""):
-    """Stream the blog agent execution, yielding (node_name, node_output) tuples.
+def _make_output_dir() -> str:
+    """Create a unique per-blog output directory under OUTPUT_DIR."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = os.path.join(OUTPUT_DIR, ts)
+    os.makedirs(out, exist_ok=True)
+    return out
 
-    Yields partial results as each node completes. The final yield contains
-    the complete state with all fields populated.
-    """
-    input_state = {"topic": topic}
-    if instructions:
-        input_state["topic"] = f"{topic}\n\nAdditional instructions: {instructions}"
+
+def run_agent_stream(topic: str, instructions: str = "",
+                     generate_images: bool = False):
+    """Stream the blog agent execution, yielding (node_name, node_output) tuples."""
+    input_state = {
+        "topic": topic if not instructions else f"{topic}\n\nAdditional instructions: {instructions}",
+        "generate_images": generate_images,
+        "output_dir": _make_output_dir(),
+    }
 
     for event in app.stream(input_state):
         for node_name, node_output in event.items():
             yield node_name, node_output
 
 
-def run_agent(topic: str, instructions: str = ""):
+def run_agent(topic: str, instructions: str = "",
+              generate_images: bool = False):
     """Run the blog agent and return structured results dict."""
-    input_state = {"topic": topic}
-    if instructions:
-        input_state["topic"] = f"{topic}\n\nAdditional instructions: {instructions}"
-
-    result = app.invoke(input_state)
-    return result
+    input_state = {
+        "topic": topic if not instructions else f"{topic}\n\nAdditional instructions: {instructions}",
+        "generate_images": generate_images,
+        "output_dir": _make_output_dir(),
+    }
+    return app.invoke(input_state)
 
 
 def save_to_history(topic: str, result: dict) -> dict:
@@ -82,6 +93,8 @@ def save_to_history(topic: str, result: dict) -> dict:
         "topic": topic,
         "title": plan.title if plan else topic,
         "needs_research": result.get("needs_research", False),
+        "generate_images": result.get("generate_images", False),
+        "output_dir": result.get("output_dir", ""),
         "num_sections": len(plan.tasks) if plan else 0,
         "num_images": len(image_specs),
         "blog_length": len(result.get("final_blog", "")),
@@ -139,6 +152,8 @@ __all__ = [
     "merge_content_node",
     "decide_images_node",
     "generate_and_place_images_node",
+    "finalize_blog_node",
+    "route_after_merge",
     "BlogState",
     "WorkerState",
     "parse_json_from_response",
